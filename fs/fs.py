@@ -9,8 +9,8 @@ import codecs
 import pickle
 import zlib
 import time
-from Crypto.Cipher import AES
-from Crypto.Random import get_random_bytes
+import secrets
+from aes.aes import encrypt, decrypt
 from tqdm import tqdm, trange
 
 import logging
@@ -25,7 +25,7 @@ logging.basicConfig(level=logging.DEBUG,
 log = logging.getLogger('FS')
 if not log.handlers:
     console = logging.StreamHandler()
-    log.addHandler(console)
+    # log.addHandler(console)
 
 
 def timer(message = 'Started'):
@@ -40,7 +40,9 @@ class PATHS:
     input: str = 'input'
     output: str = 'output'
     storage: str = 'storage'
-    root: str = os.getcwd()
+    path = os.getcwd()
+    os.chdir(path)    
+    root: str = os.path.join(os.getcwd(), 'temp')
 
 
 @dataclass
@@ -63,9 +65,11 @@ class FSD:
     segment_size: int =1024*1024*1024
     paths: PATHS
     volume_size: int = 1024*1024*1024
+    part_size: int = 16
+    blank_char: str = '\xff'
 
 
-    def __init__(self, password='', paths=PATHS('input', 'output', 'storage'), volume=1024*1024*1024):
+    def __init__(self, password='', paths=PATHS('input', 'output', 'storage', 'temp'), volume=1024*1024*1024):
         self.volume_size = volume
         self.paths = paths
         self.set_password(password)
@@ -77,15 +81,16 @@ class FSD:
             m.update(password.encode('utf-8'))
             key = m.digest()
         else:
-            key = get_random_bytes(16)
-        with codecs.open('fs.key', 'wb') as f:
+            key = secrets.token_bytes(16)
+        with codecs.open(os.path.join(self.paths.root, 'fs.key'), 'wb') as f:
             f.write(key)
         self.__read_password()
 
 
     def __read_password(self):
-        with codecs.open('fs.key', 'rb') as f:
+        with codecs.open(os.path.join(self.paths.root, 'fs.key'), 'rb') as f:
             self.key = f.read()
+        self.password = base64.b64encode(self.key).decode('utf-8') 
 
 
     def __dir_files(self, path, ext=''):
@@ -115,11 +120,11 @@ class FSD:
         try:
             log.info('loading...')
             self.memory.clear()
-            filenames, total_size = self.__dir_files(self.paths.input)
+            filenames, total_size = self.__dir_files(os.path.join(self.paths.root, self.paths.input))
 #             if total_size >= 10_000_000_000:
 #                 raise ValueError('total input files size is too large')
             for filename in (pbar := tqdm(filenames)):
-                pbar.set_description(f'Loading {os.path.basename(filename)}')
+                pbar.set_description(f'Loading')
                 with codecs.open(filename, 'rb') as f:
                     content = f.read()
                 fso = FSO(str(uuid.uuid4()), filename, os.path.basename(filename), content, hashlib.md5(content).hexdigest())
@@ -132,15 +137,24 @@ class FSD:
         try:
             log.info('dumping...')
             dump = pickle.dumps(self.memory)
-            log.info('crypting...')
-            self.cipher = AES.new(self.key, AES.MODE_CTR, use_aesni='True')
-            self.data = b''
-            for offset in (pbar := trange(0, len(dump), self.segment_size)):
-                pbar.set_description(f'Crypting {offset}')
-                self.data += self.cipher.encrypt(dump[offset:offset+self.segment_size])
-                self.nonce = self.cipher.nonce
             log.info('compressing...')
-            self.data = zlib.compress(self.data)
+            dump = zlib.compress(dump)
+            log.info('crypting...')
+            self.data = b''
+            pbar = tqdm(desc=f'Crypting', total=len(dump)//self.part_size)
+            for offset in range(0, len(dump), self.segment_size):
+                result = []
+                data = dump[offset:offset+self.segment_size]
+                for index in range(0, len(data), self.part_size):
+                    part = data[index:index+self.part_size]
+                    if len(part) < self.part_size:
+                        part += bytes(self.blank_char * (self.part_size-len(part)), 'utf-8')
+                    result += encrypt(part, self.password)
+                    pbar.update(1)
+                self.data += bytes(result)
+            pbar.close()
+
+            pass
         except Exception as e:
             self.__error(e)
 
@@ -148,11 +162,12 @@ class FSD:
     def __upload(self):
         try:
             log.info('uploading...')
-            self.__dir_clear(self.paths.storage)
+            self.__dir_clear(os.path.join(self.paths.root, self.paths.storage))
             volume_index = 1
             volume_index_width = len(str(round(len(self.data)/self.volume_size)))+1
-            for offset in trange(0, len(self.data), self.volume_size):
-                with codecs.open(os.path.join(self.paths.storage, f'store{volume_index:0{volume_index_width}d}.dat'), 'wb') as f:
+            for offset in (pbar := trange(0, len(self.data), self.volume_size)):
+                pbar.set_description(f'Uploading')
+                with codecs.open(os.path.join(self.paths.root, self.paths.storage, f'store{volume_index:0{volume_index_width}d}.dat'), 'wb') as f:
                     f.write(self.data[offset:offset+self.volume_size])
                 volume_index += 1
         except Exception as e:
@@ -163,9 +178,9 @@ class FSD:
         try:
             log.info('downloading...')
             self.data = b''
-            filenames, total_size = self.__dir_files(self.paths.storage, '.dat')
+            filenames, total_size = self.__dir_files(os.path.join(self.paths.root, self.paths.storage), '.dat')
             for filename in (pbar := tqdm(filenames)):
-                pbar.set_description(f'Downloading {os.path.basename(filename)}')
+                pbar.set_description(f'Downloading')
                 with codecs.open(filename, 'rb') as f:
                     self.data += f.read()
         except Exception as e:
@@ -174,16 +189,24 @@ class FSD:
 
     def __unpack(self):
         try:
+
+            log.info('decrypting...')      
+            dump = b''
+            pbar = tqdm(desc=f'Decrypting', total=len(self.data)//self.part_size)
+            for offset in range(0, len(self.data), self.segment_size):
+                result = []
+                data = self.data[offset:offset+self.segment_size]
+                for index in range(0 ,len(data), self.part_size):
+                    part = data[index:index+self.part_size]
+                    result += decrypt(part, self.password)
+                    pbar.update(1)
+                dump += bytes(result).replace(self.blank_char.encode('utf-8'), b'')
+            pbar.close()
             log.info('decompressing...')
-            dump = zlib.decompress(self.data)
-            log.info('decrypting...')
-            data = b''
-            self.cipher = AES.new(self.key, AES.MODE_CTR, nonce=self.nonce, use_aesni='True')
-            for offset in (pbar := trange(0, len(dump), self.segment_size)):
-                pbar.set_description(f'Decrypting {offset}')
-                data += self.cipher.decrypt(dump[offset:offset+self.segment_size])
+            output = zlib.decompress(dump)            
             log.info('pulling...')
-            self.memory = pickle.loads(data)
+            self.memory = pickle.loads(output)
+            pass
         except Exception as e:
             self.__error(e)
 
@@ -191,11 +214,11 @@ class FSD:
     def __extract(self):
         try:
             log.info('extracting...')
-            self.__dir_clear(self.paths.output)
+            self.__dir_clear(os.path.join(self.paths.root, self.paths.output))
             for file in (pbar := tqdm(self.memory)):
-                pbar.set_description(f'Extracting {file.name}')
-                filename = os.path.join(self.paths.output, file.path, file.name)
-                os.makedirs(os.path.join(self.paths.output, file.path), exist_ok=True)
+                pbar.set_description(f'Extracting')
+                filename = os.path.join(self.paths.root, self.paths.output, file.path, file.name)
+                os.makedirs(os.path.join(self.paths.root, self.paths.output, file.path), exist_ok=True)
                 with codecs.open(filename, 'wb') as f:
                     if hashlib.md5(file.content).hexdigest() == file.crc:
                         f.write(file.content)
@@ -218,14 +241,9 @@ class FSD:
 
 
 if __name__ == "__main__":
-    path = os.getcwd()
-    os.chdir(path)
-    timer()
-    fsd = FSD('', PATHS('input', 'output', 'storage'))
-    timer('started')
+    # demo init (auto pass gen)
+    fsd = FSD()
+    # file system conversion, packaging and encryption
     fsd.store()
-    timer('stored')
-    timer('#reset')
+    # decryption, decompression and file system conversion
     fsd.receive()
-    timer('received')
-    timer('#reset')

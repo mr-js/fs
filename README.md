@@ -1,25 +1,36 @@
 # fs
  Virtual file system with encryption support (prototype)
 
+ ## Features
+
+ Dependency-free (native, no third-party packages to work with the file system and encryption)!
+
+![fs](/images/fs-0.png)
+
+![fs](/images/fs-1.png)
+
+![fs](/images/fs-2.png)
+
  ## Usage
  See examples below
 
  ## Examples
- Use method "store" to pack data from directory "input" to crypted container "storage" and "received" to unpack data from "storage" to directory "output":
- ```python
- from fs import PATHS, FSD, FSO
 
- path = os.getcwd()
- os.chdir(path)
- timer()
- fsd = FSD('', PATHS('input', 'output', 'storage'))
- timer('started')
+ Save all files from [temp/input/](temp/input/) to the encrypted [temp/storage/](temp/storage/) virtual file system and decrypt back to [temp/output/](temp/output/)
+  
+ ```python
+ from fs import FSD
+ 
+ # demo init (auto pass gen)
+ fsd = FSD()
+ # file system conversion, packaging and encryption
  fsd.store()
- timer('stored')
- timer('#reset')
+ # decryption, decompression and file system conversion
  fsd.receive()
- timer('received')
- timer('#reset')
  ```
+
+ > [!NOTE]
+ > Right now only small files are supported in experimental mode (e.g. as in the demo [test.txt](/temp/input/test.txt)).
+
  ## Remarks
- The encryption key is generated automatically and stored in a file "fs.key". Timer is used for benchmarks.
+ The encryption key is generated automatically and stored in a file "fs.key".
